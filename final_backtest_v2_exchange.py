@@ -1,21 +1,21 @@
 """
-Exchange-fed version of final_backtest_v2.py.
-Uses the user's original backtest_engine.py for results/trade containers,
-and pulls OHLCV directly from an exchange via ccxt instead of CSV files.
+Walk-forward, no-lookahead version of final_backtest_v2_exchange.py.
 
-Audit mode:
-- Runs an in-memory sanity audit after each symbol backtest
-- No CSV saving required
-- Compares backtest trades against stricter execution assumptions
+Key differences vs the original:
+- Rebuilds market structure on data[:t+1] at each bar t
+- Only allows setups that trigger on the current last bar
+- Executes at next bar open, not same-bar close
+- Rebuilds stop/target from the actual executed entry
+- No separate audit pass needed to test lookahead; this runner itself is causal
 """
 
 import argparse
+import copy
 import os
 import sys
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 import numpy as np
-import pandas as pd
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -24,14 +24,9 @@ if SCRIPT_DIR not in sys.path:
 from market_structure import MarketStructureEngine, StructureState
 from breaker_detector import BreakerDetector, BreakerType, SignalStatus
 from liquidity_mapper import LiquidityMapper, LiquidityLevel
-from additional_setups import ThreeTapDetector, TradeSetup, SetupType, simulate_trade
+from additional_setups import ThreeTapDetector, TradeSetup, SetupType
 from backtest_engine import BacktestResults, TradeRecord
 from exchange_data import build_exchange_dataset
-from backtest_sanity_audit import (
-    BacktestSanityAuditor,
-    print_summary,
-    summarize_conservative_results,
-)
 
 
 def calculate_sma(arr: np.ndarray, period: int) -> np.ndarray:
@@ -82,9 +77,9 @@ def calculate_adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, perio
     atr_s = np.zeros(n)
     plus_dm_s = np.zeros(n)
     minus_dm_s = np.zeros(n)
-    atr_s[period] = np.sum(tr[1 : period + 1])
-    plus_dm_s[period] = np.sum(plus_dm[1 : period + 1])
-    minus_dm_s[period] = np.sum(minus_dm[1 : period + 1])
+    atr_s[period] = np.sum(tr[1:period + 1])
+    plus_dm_s[period] = np.sum(plus_dm[1:period + 1])
+    minus_dm_s[period] = np.sum(minus_dm[1:period + 1])
 
     for i in range(period + 1, n):
         atr_s[i] = atr_s[i - 1] - (atr_s[i - 1] / period) + tr[i]
@@ -105,7 +100,7 @@ def calculate_adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, perio
 
     first_adx = period * 2
     if first_adx < n:
-        adx[first_adx] = np.mean(dx[period + 1 : first_adx + 1])
+        adx[first_adx] = np.mean(dx[period + 1:first_adx + 1])
         for i in range(first_adx + 1, n):
             adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
 
@@ -235,69 +230,169 @@ class OTEv2Detector:
 
 def default_symbols() -> List[str]:
     return [
-        "BTC/USDT",
-        "ETH/USDT",
-        "BNB/USDT",
-        "SOL/USDT",
-        "XRP/USDT",
-        "ADA/USDT",
-        "DOGE/USDT",
-        "AVAX/USDT",
-        "LINK/USDT",
-        "DOT/USDT",
-        "MATIC/USDT",
-        "LTC/USDT",
-        "ATOM/USDT",
-        "ETC/USDT",
-        "UNI/USDT",
-        "XLM/USDT",
-        "ALGO/USDT",
-        "NEAR/USDT",
-        "FIL/USDT",
-        "APT/USDT",
+        "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
+        "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "LINK/USDT", "DOT/USDT",
+        "MATIC/USDT", "LTC/USDT", "ATOM/USDT", "ETC/USDT", "UNI/USDT",
+        "XLM/USDT", "ALGO/USDT", "NEAR/USDT", "FIL/USDT", "APT/USDT",
     ]
 
 
-def build_candles_df(data: Dict[str, Any]) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "timestamp": data["timestamps"],
-            "open": data["opens"],
-            "high": data["highs"],
-            "low": data["lows"],
-            "close": data["closes"],
-        }
-    )
+def simulate_trade_from_next_open(
+    setup: TradeSetup,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    opens: np.ndarray,
+    atr: np.ndarray,
+    entry_bar: int,
+) -> TradeSetup:
+    """
+    Causal execution model:
+    - setup triggers on bar t
+    - actual execution is at open[t+1]
+    - stop/target are rebuilt from executed entry
+    - simulation starts on entry_bar itself
+    - conservative same-bar handling: stop first, then target
+    """
+    out = copy.deepcopy(setup)
+
+    if entry_bar >= len(opens):
+        out.status = SignalStatus.EXPIRED
+        return out
+
+    executed_entry = float(opens[entry_bar])
+    atr_val = atr[min(entry_bar, len(atr) - 1)]
+
+    if out.setup_type == SetupType.BREAKER:
+        if out.direction == "short":
+            risk = abs(setup.stop_price - setup.entry_price)
+            out.entry_price = executed_entry
+            out.stop_price = executed_entry + risk
+            out.target_price = executed_entry - risk * setup.rr
+        else:
+            risk = abs(setup.entry_price - setup.stop_price)
+            out.entry_price = executed_entry
+            out.stop_price = executed_entry - risk
+            out.target_price = executed_entry + risk * setup.rr
+    else:
+        if out.direction == "short":
+            risk = abs(setup.stop_price - setup.entry_price)
+            out.entry_price = executed_entry
+            out.stop_price = executed_entry + risk
+            out.target_price = executed_entry - risk * setup.rr
+        else:
+            risk = abs(setup.entry_price - setup.stop_price)
+            out.entry_price = executed_entry
+            out.stop_price = executed_entry - risk
+            out.target_price = executed_entry + risk * setup.rr
+
+    if out.risk <= 0:
+        out.status = SignalStatus.INVALIDATED
+        return out
+
+    out.trigger_index = entry_bar - 1
+
+    for i in range(entry_bar, len(opens)):
+        if out.direction == "short":
+            if highs[i] >= out.stop_price:
+                out.status = SignalStatus.STOPPED
+                out.exit_index = i
+                out.exit_price = out.stop_price
+                out.pnl_r = -1.0
+                return out
+            if lows[i] <= out.target_price:
+                out.status = SignalStatus.TARGET_HIT
+                out.exit_index = i
+                out.exit_price = out.target_price
+                out.pnl_r = out.reward / out.risk if out.risk > 0 else 0.0
+                return out
+        else:
+            if lows[i] <= out.stop_price:
+                out.status = SignalStatus.STOPPED
+                out.exit_index = i
+                out.exit_price = out.stop_price
+                out.pnl_r = -1.0
+                return out
+            if highs[i] >= out.target_price:
+                out.status = SignalStatus.TARGET_HIT
+                out.exit_index = i
+                out.exit_price = out.target_price
+                out.pnl_r = out.reward / out.risk if out.risk > 0 else 0.0
+                return out
+
+    out.status = SignalStatus.ACTIVE
+    return out
 
 
-def run_symbol_audit(
-    coin: str,
-    candles_df: pd.DataFrame,
-    audit_trade_rows: List[Dict[str, Any]],
-    audit_mode: str,
-) -> Optional[Dict[str, float]]:
-    if not audit_trade_rows:
-        print(f"\nAUDIT [{coin}]")
-        print("No completed trades to audit.")
-        return None
+def get_triggered_setups_for_last_bar(
+    state: StructureState,
+    brk_det: BreakerDetector,
+    tap_det: ThreeTapDetector,
+    ote_v2: OTEv2Detector,
+    liq: LiquidityMapper,
+    opens: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    volumes: np.ndarray,
+    timestamps: List[str],
+    atr: np.ndarray,
+    adx: np.ndarray,
+    current_bar: int,
+) -> List[TradeSetup]:
+    """
+    Build only setups whose trigger occurs on the current last bar.
+    This is the key no-lookahead rule.
+    """
+    levels = liq.map_liquidity(state, highs, lows, closes, atr)
+    out: List[TradeSetup] = []
 
-    trades_df = pd.DataFrame(audit_trade_rows)
+    breakers = brk_det.detect(state, highs, lows, closes, atr, htf_bias="neutral")
+    for bk in breakers:
+        if bk.status != SignalStatus.TRIGGERED or bk.trigger_index is None or bk.entry_price is None:
+            continue
+        if bk.trigger_index != current_bar:
+            continue
 
-    auditor = BacktestSanityAuditor(
-        candles=candles_df,
-        trades=trades_df,
-        signals=None,
-        force_next_bar_entry=(audit_mode == "conservative"),
-        force_conservative_same_bar=(audit_mode == "conservative"),
-        forbid_entry_before_pivot_confirmation=False,  # no pivot_confirm_time yet
-        max_allowed_overlap_per_symbol=1,
-    )
-    audit = auditor.run()
+        atr_val = atr[min(current_bar, len(atr) - 1)]
+        direction = "short" if bk.breaker_type == BreakerType.BEARISH else "long"
+        stop = bk.zone_high + atr_val * 0.3 if bk.breaker_type == BreakerType.BEARISH else bk.zone_low - atr_val * 0.3
 
-    print(f"\nAUDIT [{coin}]")
-    print_summary(audit)
+        lvls = liq.map_liquidity(state, highs, lows, closes, atr, current_bar=current_bar)
+        fta = liq.find_fta(lvls, bk.entry_price, direction, stop)
+        fta_type = "default"
 
-    return summarize_conservative_results(audit.trade_results)
+        if fta and fta.rr_with_stop and fta.rr_with_stop >= 1.5:
+            target = fta.level.price
+            fta_type = fta.level.liquidity_type.value
+        else:
+            risk = abs(bk.entry_price - stop)
+            if risk <= 0:
+                continue
+            target = bk.entry_price - risk * 1.5 if direction == "short" else bk.entry_price + risk * 1.5
+
+        out.append(
+            TradeSetup(
+                setup_type=SetupType.BREAKER,
+                direction=direction,
+                entry_price=bk.entry_price,
+                stop_price=stop,
+                target_price=target,
+                trigger_index=current_bar,
+                formation_index=bk.formation_index,
+                quality_score=bk.quality_score,
+                fta_type=fta_type,
+            )
+        )
+
+    for s in tap_det.detect(state, highs, lows, closes, atr):
+        if s.trigger_index == current_bar:
+            out.append(s)
+
+    for s in ote_v2.detect(state, highs, lows, closes, atr, adx, levels):
+        if s.trigger_index == current_bar:
+            out.append(s)
+
+    return out
 
 
 def run_final_backtest(
@@ -308,8 +403,6 @@ def run_final_backtest(
     min_bars: int,
     max_bars: Optional[int],
     market_type: str,
-    audit: bool = False,
-    audit_mode: str = "conservative",
 ) -> BacktestResults:
     all_data = build_exchange_dataset(
         symbols=symbols,
@@ -322,8 +415,9 @@ def run_final_backtest(
     )
 
     print("=" * 70)
-    print("FINAL PRODUCTION BACKTEST v2 LIVE")
+    print("FINAL PRODUCTION BACKTEST v2 WALK-FORWARD")
     print("Breaker + Three Tap + OTEv2 (S/R confluence)")
+    print("No-lookahead replay | next-bar-open execution")
     print("200d SMA filter | ADX >= 20 chop filter | Q >= 50")
     print("%d coins | %s -> latest via %s (%s)" % (len(all_data), start_date, exchange_id, market_type))
     print("=" * 70)
@@ -335,7 +429,6 @@ def run_final_backtest(
     ote_v2 = OTEv2Detector(min_impulse_atr=3.0, min_adx=25)
 
     results = BacktestResults()
-    global_audit_stats: List[Dict[str, float]] = []
 
     for data in all_data:
         o = data["opens"]
@@ -347,181 +440,130 @@ def run_final_backtest(
         coin = data["symbol"]
         n = len(c)
 
-        candles_df = build_candles_df(data)
-        audit_trade_rows: List[Dict[str, Any]] = []
-
         sma = calculate_sma(c, 4800)
-        atr = engine._calculate_atr(h, l, c)
-        adx = calculate_adx(h, l, c, 14)
-        state = engine.analyze(o, h, l, c, v, ts)
-        levels = liq.map_liquidity(state, h, l, c, atr)
+        atr_full = engine._calculate_atr(h, l, c)
+        adx_full = calculate_adx(h, l, c, 14)
 
-        all_setups: List[TradeSetup] = []
+        last_entry_bar = -10
+        coin_trade_count = 0
 
-        breakers = brk_det.detect(state, h, l, c, atr, htf_bias="neutral")
-        for bk in breakers:
-            if bk.status != SignalStatus.TRIGGERED or bk.trigger_index is None or bk.entry_price is None:
+        start_bar = max(4800, engine.atr_period + engine.swing_lookback * 2 + 1)
+
+        for t in range(start_bar, n - 1):
+            if t - last_entry_bar < 6:
                 continue
 
-            eb = bk.trigger_index
-            if eb >= n - 1 or eb < 4800:
-                continue
+            o_s = o[: t + 1]
+            h_s = h[: t + 1]
+            l_s = l[: t + 1]
+            c_s = c[: t + 1]
+            v_s = v[: t + 1]
+            ts_s = ts[: t + 1]
+            atr_s = atr_full[: t + 1]
+            adx_s = adx_full[: t + 1]
 
-            atr_val = atr[min(eb, len(atr) - 1)]
-            direction = "short" if bk.breaker_type == BreakerType.BEARISH else "long"
-            stop = bk.zone_high + atr_val * 0.3 if bk.breaker_type == BreakerType.BEARISH else bk.zone_low - atr_val * 0.3
-            lvls = liq.map_liquidity(state, h, l, c, atr, current_bar=eb)
-            fta = liq.find_fta(lvls, bk.entry_price, direction, stop)
-            fta_type = "default"
-
-            if fta and fta.rr_with_stop and fta.rr_with_stop >= 1.5:
-                target = fta.level.price
-                fta_type = fta.level.liquidity_type.value
-            else:
-                risk = abs(bk.entry_price - stop)
-                if risk <= 0:
-                    continue
-                target = bk.entry_price - risk * 1.5 if direction == "short" else bk.entry_price + risk * 1.5
-
-            all_setups.append(
-                TradeSetup(
-                    setup_type=SetupType.BREAKER,
-                    direction=direction,
-                    entry_price=bk.entry_price,
-                    stop_price=stop,
-                    target_price=target,
-                    trigger_index=eb,
-                    formation_index=bk.formation_index,
-                    quality_score=bk.quality_score,
-                    fta_type=fta_type,
-                )
+            state = engine.analyze(o_s, h_s, l_s, c_s, v_s, ts_s)
+            setups = get_triggered_setups_for_last_bar(
+                state=state,
+                brk_det=brk_det,
+                tap_det=tap_det,
+                ote_v2=ote_v2,
+                liq=liq,
+                opens=o_s,
+                highs=h_s,
+                lows=l_s,
+                closes=c_s,
+                volumes=v_s,
+                timestamps=ts_s,
+                atr=atr_s,
+                adx=adx_s,
+                current_bar=t,
             )
 
-        all_setups.extend(tap_det.detect(state, h, l, c, atr))
-        all_setups.extend(ote_v2.detect(state, h, l, c, atr, adx, levels))
-
-        all_setups.sort(key=lambda s: s.trigger_index)
-        last_bar = -10
-        trade_counter = 0
-
-        for setup in all_setups:
-            eb = setup.trigger_index
-            if eb >= n - 1 or eb < 4800:
-                continue
-            if setup.quality_score < 50 or setup.rr < 1.5 or eb - last_bar < 6:
+            if not setups:
                 continue
 
-            if not np.isnan(sma[eb]):
-                if c[eb] > sma[eb] and setup.direction == "short":
-                    continue
-                if c[eb] < sma[eb] and setup.direction == "long":
+            setups.sort(key=lambda s: (s.quality_score, s.rr), reverse=True)
+
+            chosen = None
+            for setup in setups:
+                if setup.quality_score < 50 or setup.rr < 1.5:
                     continue
 
-            if eb < len(adx) and not np.isnan(adx[eb]) and adx[eb] < 20:
-                continue
+                if not np.isnan(sma[t]):
+                    if c[t] > sma[t] and setup.direction == "short":
+                        continue
+                    if c[t] < sma[t] and setup.direction == "long":
+                        continue
 
-            atr_val = atr[min(eb, len(atr) - 1)]
-            if setup.setup_type == SetupType.BREAKER:
-                lvls = liq.map_liquidity(state, h, l, c, atr, current_bar=eb)
-                dangerous = liq.check_liquidity_near_stop(lvls, setup.stop_price, atr_val, setup.direction)
-                if len(dangerous) >= 2:
+                if t < len(adx_full) and not np.isnan(adx_full[t]) and adx_full[t] < 20:
                     continue
 
-            setup = simulate_trade(setup, h, l, c)
-            if setup.status not in (SignalStatus.TARGET_HIT, SignalStatus.STOPPED):
+                atr_val = atr_full[min(t, len(atr_full) - 1)]
+                if setup.setup_type == SetupType.BREAKER:
+                    levels_t = liq.map_liquidity(state, h_s, l_s, c_s, atr_s, current_bar=t)
+                    dangerous = liq.check_liquidity_near_stop(levels_t, setup.stop_price, atr_val, setup.direction)
+                    if len(dangerous) >= 2:
+                        continue
+
+                chosen = setup
+                break
+
+            if chosen is None:
                 continue
 
-            last_bar = eb
-            trade_counter += 1
+            executed = simulate_trade_from_next_open(
+                setup=chosen,
+                highs=h,
+                lows=l,
+                opens=o,
+                atr=atr_full,
+                entry_bar=t + 1,
+            )
 
-            outcome = "win" if setup.status == SignalStatus.TARGET_HIT else "loss"
-            pnl_r = setup.pnl_r or 0.0
-            entry_date = ts[eb][:19] if eb < len(ts) else "?"
-            exit_bar = setup.exit_index if setup.exit_index is not None else eb
+            if executed.status not in (SignalStatus.TARGET_HIT, SignalStatus.STOPPED):
+                continue
+
+            last_entry_bar = t + 1
+            coin_trade_count += 1
+
+            outcome = "win" if executed.status == SignalStatus.TARGET_HIT else "loss"
+            pnl_r = executed.pnl_r or 0.0
+            entry_bar = t + 1
+            exit_bar = executed.exit_index if executed.exit_index is not None else entry_bar
+
+            entry_date = ts[entry_bar][:19] if entry_bar < len(ts) else "?"
             exit_date = ts[exit_bar][:19] if exit_bar < len(ts) else "?"
-            exit_price = setup.exit_price if setup.exit_price is not None else 0.0
+            exit_price = executed.exit_price if executed.exit_price is not None else 0.0
 
             results.trades.append(
                 TradeRecord(
                     coin=coin,
-                    direction=setup.direction,
-                    entry_price=setup.entry_price,
-                    stop_price=setup.stop_price,
-                    target_price=setup.target_price,
+                    direction=executed.direction,
+                    entry_price=executed.entry_price,
+                    stop_price=executed.stop_price,
+                    target_price=executed.target_price,
                     exit_price=exit_price,
                     entry_date=entry_date,
                     exit_date=exit_date,
                     pnl_r=pnl_r,
                     outcome=outcome,
-                    rr_ratio=setup.rr,
-                    quality_score=setup.quality_score,
-                    regime=classify_period(ts[eb][:10]),
-                    fta_type=setup.fta_type,
-                    breaker_type=setup.setup_type.value,
+                    rr_ratio=executed.rr,
+                    quality_score=executed.quality_score,
+                    regime=classify_period(ts[t][:10]),
+                    fta_type=executed.fta_type,
+                    breaker_type=executed.setup_type.value,
                 )
             )
 
-            audit_trade_rows.append(
-                {
-                    "trade_id": f"{coin.replace('/', '_')}_{trade_counter}",
-                    "symbol": coin,
-                    "side": setup.direction,
-                    "signal_time": ts[eb],
-                    "entry_time": ts[eb],
-                    "entry_price": float(setup.entry_price),
-                    "stop_price": float(setup.stop_price),
-                    "target_price": float(setup.target_price),
-                    "exit_time": exit_date,
-                    "exit_price": float(exit_price),
-                    "outcome": outcome,
-                    "setup_type": setup.setup_type.value,
-                    "signal_bar_index": int(eb),
-                    "entry_bar_index": int(eb),
-                    "exit_bar_index": int(exit_bar),
-                    "used_next_bar_entry": False,
-                    "used_conservative_intrabar": False,
-                }
-            )
+        print("  %-6s | %3d trades" % (coin, coin_trade_count))
 
-        coin_trades = sum(1 for t in results.trades if t.coin == coin)
-        print("  %-6s | %3d trades" % (coin, coin_trades))
-
-        if audit:
-            stats = run_symbol_audit(
-                coin=coin,
-                candles_df=candles_df,
-                audit_trade_rows=audit_trade_rows,
-                audit_mode=audit_mode,
-            )
-            if stats is not None:
-                global_audit_stats.append(stats)
-
-    results.print_summary("FINAL v2 LIVE: BREAKER + THREE TAP + OTEv2 + ADX FILTER")
-
-    if audit and global_audit_stats:
-        total_completed = sum(int(s["completed_trades"]) for s in global_audit_stats)
-        total_wins = sum(int(s["wins"]) for s in global_audit_stats)
-        total_losses = sum(int(s["losses"]) for s in global_audit_stats)
-        total_r = sum(float(s["total_r"]) for s in global_audit_stats)
-
-        # Aggregate PF approximately from per-symbol PF is wrong,
-        # so keep the global view simple unless you extend the auditor
-        # to return gross profit / gross loss totals directly.
-        print("\n" + "=" * 70)
-        print("AUDIT AGGREGATE (conservative)")
-        print("=" * 70)
-        print(f"Completed trades: {total_completed}")
-        print(f"Wins:             {total_wins}")
-        print(f"Losses:           {total_losses}")
-        print(f"Win rate:         {(total_wins / total_completed * 100):.1f}%" if total_completed else "Win rate:         0.0%")
-        print(f"Total R:          {total_r:+.2f}R")
-        print(f"Avg R/trade:      {(total_r / total_completed):+.3f}R" if total_completed else "Avg R/trade:      +0.000R")
-
+    results.print_summary("FINAL WALK-FORWARD: NO-LOOKAHEAD + NEXT-OPEN EXECUTION")
     return results
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run exchange-fed crypto backtest")
+    parser = argparse.ArgumentParser(description="Run walk-forward exchange-fed crypto backtest")
     parser.add_argument("--exchange", default="binance")
     parser.add_argument("--market-type", default="spot")
     parser.add_argument("--timeframe", default="1h")
@@ -529,13 +571,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-bars", type=int, default=5000)
     parser.add_argument("--max-bars", type=int, default=None)
     parser.add_argument("--symbols", nargs="*", default=None)
-    parser.add_argument("--audit", action="store_true", help="Run sanity audit after backtest")
-    parser.add_argument(
-        "--audit-mode",
-        choices=["basic", "conservative"],
-        default="conservative",
-        help="Audit strictness",
-    )
     return parser.parse_args()
 
 
@@ -551,6 +586,4 @@ if __name__ == "__main__":
         min_bars=args.min_bars,
         max_bars=args.max_bars,
         market_type=args.market_type,
-        audit=args.audit,
-        audit_mode=args.audit_mode,
     )

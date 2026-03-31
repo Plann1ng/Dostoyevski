@@ -53,7 +53,7 @@ from config import (
     EQUAL_THRESHOLD_ATR, BREAKER_MAX_RETEST, BREAKER_MIN_DISPLACEMENT,
     QUALITY_GATE, SMA_PERIOD, ROLLING_WINDOW, LOG_FILE, TRADE_JOURNAL,
 )
-from binance_client import BinanceDemoClient, fetch_full_klines
+from binance_client import BinanceFuturesDemoClient, fetch_full_klines
 from market_structure import MarketStructureEngine
 from breaker_detector import BreakerDetector, BreakerType, SignalStatus
 from liquidity_mapper import LiquidityMapper
@@ -176,7 +176,9 @@ class StrategyEngine:
                     if bk.breaker_type == BreakerType.BEARISH
                     else bk.zone_low - atr_val * STOP_BUFFER_ATR)
 
-            levels = self.liq_mapper.map_liquidity(state, h_w, l_w, c_w, atr, current_bar=last_bar_idx)
+            levels = self.liq_mapper.map_liquidity(
+                state, h_w, l_w, c_w, atr, current_bar=last_bar_idx
+            )
             fta = self.liq_mapper.find_fta(levels, bk.entry_price, direction, stop)
 
             if fta and fta.rr_with_stop and fta.rr_with_stop >= MIN_RR:
@@ -248,7 +250,9 @@ class StrategyEngine:
 
             # Stop safety check
             if setup["type"] == "breaker":
-                levels = self.liq_mapper.map_liquidity(state, h_w, l_w, c_w, atr, current_bar=last_bar_idx)
+                levels = self.liq_mapper.map_liquidity(
+                    state, h_w, l_w, c_w, atr, current_bar=last_bar_idx
+                )
                 dangerous = self.liq_mapper.check_liquidity_near_stop(
                     levels, setup["stop"], atr_val, setup["direction"]
                 )
@@ -294,7 +298,7 @@ def log_trade(symbol, setup_type, direction, entry_price, stop_price,
 
 class TradingBot:
     def __init__(self, symbols: List[str]):
-        self.client = BinanceDemoClient(API_KEY, API_SECRET, REST_BASE_URL)
+        self.client = BinanceFuturesDemoClient(API_KEY, API_SECRET, REST_BASE_URL)
         self.engine = StrategyEngine()
         self.symbols = symbols
         self.states: Dict[str, SymbolState] = {}
@@ -331,7 +335,7 @@ class TradingBot:
                 state.candles = klines
                 self.states[symbol] = state
                 logger.info(f"  {symbol}: {len(klines)} candles loaded "
-                           f"({klines[0]['timestamp']} → {klines[-1]['timestamp']})")
+                            f"({klines[0]['timestamp']} → {klines[-1]['timestamp']})")
 
                 # Fetch daily SMA
                 daily_klines = fetch_full_klines(
@@ -454,44 +458,42 @@ class TradingBot:
             logger.warning(f"  {symbol}: Quantity too small — skipping")
             return
 
-        # === SPOT TRADING NOTE ===
-        # Binance Spot Demo doesn't support true shorting.
-        # For SHORT signals: we log the signal but don't execute.
-        # For LONG signals: buy with market order, set OCO exit.
-        #
-        # To trade shorts, you'd need Margin or Futures demo mode.
-        # The committee recommends starting with long-only on spot,
-        # which produced +297.5R in the backtest (PF 1.34).
-
-        if direction == "short":
-            logger.info(f"  {symbol}: SHORT signal logged (spot mode — long only)")
-            log_trade(symbol, setup_type, direction, entry, stop, target,
-                     quantity, signal["quality"], "LOGGED_SHORT",
-                     "Spot demo mode — shorts logged only")
-            return
-
-        # Execute LONG entry
         try:
-            logger.info(f"  {symbol}: Executing MARKET BUY {quantity} @ ~{entry:.2f}")
-            order = self.client.place_market_order(symbol, "BUY", quantity)
-            fill_price = float(order.get("fills", [{}])[0].get("price", entry))
+            entry_side = "BUY" if direction == "long" else "SELL"
+            exit_side = "SELL" if direction == "long" else "BUY"
+
+            logger.info(f"  {symbol}: Executing MARKET {entry_side} {quantity} @ ~{entry:.2f}")
+            order = self.client.place_market_order(symbol, entry_side, quantity)
+
+            avg_price = order.get("avgPrice")
+            raw_price = order.get("price")
+
+            if avg_price not in (None, "", "0", "0.0", "0.00", "0.00000"):
+                fill_price = float(avg_price)
+            elif raw_price not in (None, "", "0", "0.0", "0.00", "0.00000"):
+                fill_price = float(raw_price)
+            else:
+                fill_price = entry
             logger.info(f"  {symbol}: FILLED at {fill_price:.2f}")
 
-            # Place OCO exit (take profit + stop loss)
-            stop_limit = self.client.round_price(symbol, stop * 0.999)  # Slightly below stop trigger
-            logger.info(f"  {symbol}: Placing OCO exit — TP={target:.2f}, SL={stop:.2f}")
+            logger.info(f"  {symbol}: Placing futures exits — TP={target:.2f}, SL={stop:.2f}")
 
-            oco = self.client.place_oco_order(
+            sl_order = self.client.place_stop_market_order(
                 symbol=symbol,
-                side="SELL",
+                side=exit_side,
+                stop_price=stop,
                 quantity=quantity,
-                price=target,           # Take profit
-                stop_price=stop,        # Stop loss trigger
-                stop_limit_price=stop_limit,  # Stop loss limit
+                reduce_only=True,
             )
-            logger.info(f"  {symbol}: OCO placed — orders active")
 
-            # Record position
+            tp_order = self.client.place_take_profit_market_order(
+                symbol=symbol,
+                side=exit_side,
+                stop_price=target,
+                quantity=quantity,
+                reduce_only=True,
+            )
+
             state.position = {
                 "direction": direction,
                 "entry_price": fill_price,
@@ -500,87 +502,81 @@ class TradingBot:
                 "quantity": quantity,
                 "setup_type": setup_type,
                 "entry_time": datetime.now(timezone.utc).isoformat(),
+                "entry_order_id": order.get("orderId"),
+                "sl_order_id": sl_order.get("orderId"),
+                "tp_order_id": tp_order.get("orderId"),
             }
             state.last_entry_bar = state.n - 1
 
-            log_trade(symbol, setup_type, direction, fill_price, stop, target,
-                     quantity, signal["quality"], "EXECUTED",
-                     f"OCO exit placed. Order ID: {oco.get('orderListId', 'N/A')}")
+            log_trade(
+                symbol, setup_type, direction, fill_price, stop, target,
+                quantity, signal["quality"], "EXECUTED",
+                f"SL={state.position['sl_order_id']} TP={state.position['tp_order_id']}"
+            )
 
         except Exception as e:
             logger.error(f"  {symbol}: Order failed — {e}")
-            log_trade(symbol, setup_type, direction, entry, stop, target,
-                     quantity, signal["quality"], "FAILED", str(e))
+            log_trade(
+                symbol, setup_type, direction, entry, stop, target,
+                quantity, signal["quality"], "FAILED", (e)
+            )
 
     def run_poll_mode(self):
-        """
-        Simple polling mode: check for new candles every 30 seconds.
-        More reliable than WebSocket for initial deployment.
-        """
-        logger.info("\nStarting polling mode (checks every 30 seconds)...")
-        logger.info("Press Ctrl+C to stop.\n")
-
-        # Track the last closed candle timestamp per symbol
-        last_candle_time = {}
-        for symbol in self.states:
-            if self.states[symbol].candles:
-                last_candle_time[symbol] = self.states[symbol].candles[-1]["close_time"]
-            else:
-                last_candle_time[symbol] = 0
-
         self.running = True
         cycle = 0
 
-        while self.running:
-            try:
+        try:
+            while self.running:
                 cycle += 1
-                now = datetime.now(timezone.utc)
+                now = datetime.now()
 
-                for symbol in list(self.states.keys()):
+                for symbol in self.symbols:
                     try:
-                        # Fetch the latest 2 candles
-                        klines = self.client.get_klines(symbol, TIMEFRAME, limit=2)
+                        latest = self.client.get_klines(symbol, TIMEFRAME, limit=2)
+                        if not latest or len(latest) < 2:
+                            continue
 
-                        for k in klines:
-                            close_time = k[6]
-                            # Check if this candle has closed and we haven't processed it
-                            is_closed = int(time.time() * 1000) > close_time
-                            is_new = close_time > last_candle_time.get(symbol, 0)
+                        raw = latest[-2]
+                        closed_candle = {
+                            "timestamp": int(raw[0]),
+                            "open": float(raw[1]),
+                            "high": float(raw[2]),
+                            "low": float(raw[3]),
+                            "close": float(raw[4]),
+                            "volume": float(raw[5]),
+                        }
 
-                            if is_closed and is_new:
-                                candle = {
-                                    "timestamp": k[0],
-                                    "open": float(k[1]),
-                                    "high": float(k[2]),
-                                    "low": float(k[3]),
-                                    "close": float(k[4]),
-                                    "volume": float(k[5]),
-                                    "close_time": close_time,
-                                }
-                                logger.info(f"New candle: {symbol} close={candle['close']:.2f} "
-                                          f"vol={candle['volume']:.1f}")
-                                self.process_new_candle(symbol, candle)
-                                last_candle_time[symbol] = close_time
+                        state = self.states.get(symbol)
+                        if state is None or not state.candles:
+                            continue
+
+                        last_ts = state.candles[-1]["timestamp"]
+                        if closed_candle["timestamp"] != last_ts:
+                            logger.info(
+                                f"{symbol}: New candle closed @ {closed_candle['timestamp']}"
+                            )
+                            self.process_new_candle(symbol, closed_candle)
 
                     except Exception as e:
-                        logger.error(f"Error processing {symbol}: {e}")
+                        logger.error(f"{symbol}: Polling error — {e}")
+                        continue
 
-                # Status heartbeat every 10 cycles (~5 minutes)
+                # Status heartbeat every 10 cycles (~10 minutes if sleep=60)
                 if cycle % 10 == 0:
                     active = sum(1 for s in self.states.values() if s.position)
                     pending = sum(1 for s in self.states.values() if s.pending_signal)
                     logger.info(f"[Heartbeat] {now.strftime('%H:%M')} | "
-                              f"Positions: {active} | Pending signals: {pending} | "
-                              f"Cycle: {cycle}")
+                                f"Positions: {active} | Pending signals: {pending} | "
+                                f"Cycle: {cycle}")
 
-                time.sleep(30)
+                time.sleep(10)
 
-            except KeyboardInterrupt:
-                logger.info("\nShutting down gracefully...")
-                self.running = False
-            except Exception as e:
-                logger.error(f"Main loop error: {e}")
-                time.sleep(5)
+        except KeyboardInterrupt:
+            logger.info("\nShutting down gracefully...")
+            self.running = False
+        except Exception as e:
+            logger.error(f"Main loop error: {e}")
+            time.sleep(60)
 
         logger.info("Bot stopped.")
 

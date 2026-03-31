@@ -20,12 +20,12 @@ API_SECRET = "YOUR_DEMO_API_SECRET_HERE"
 
 # --- Binance Demo Mode Endpoints ---
 # These are DIFFERENT from live Binance endpoints
-REST_BASE_URL = "https://demo-api.binance.com"
-WS_STREAM_URL = "wss://demo-stream.binance.com/ws"
-WS_API_URL = "wss://demo-ws-api.binance.com/ws-api/v3"
+REST_BASE_URL = "https://demo-fapi.binance.com"
+WS_STREAM_URL = "wss://fstream.binancefuture.com"
+WS_API_URL = "wss://testnet.binancefuture.com/ws-fapi/v1"
 
 # --- Trading Parameters (committee-validated) ---
-TIMEFRAME = "1h"                    # Validated timeframe
+TIMEFRAME = "1m"                    # Validated timeframe
 SYMBOLS = [                         # Top performers from backtest
     "BTCUSDT",
     "SOLUSDT",
@@ -40,7 +40,7 @@ SYMBOLS = [                         # Top performers from backtest
 ]
 
 # --- Risk Management (committee rules) ---
-RISK_PER_TRADE = 0.005              # 0.5% of account per trade (conservative start)
+RISK_PER_TRADE = 0.005              # 1% of account per trade (conservative start)
 MIN_RR = 1.5                        # Minimum risk:reward ratio
 MAX_POSITIONS_PER_SYMBOL = 1        # Never more than 1 position per coin
 MIN_BARS_BETWEEN_ENTRIES = 6        # Minimum 6 candles between entries on same coin

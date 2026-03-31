@@ -203,6 +203,7 @@ class BinanceFuturesDemoClient:
             "side": side,
             "type": "MARKET",
             "quantity": self.format_quantity(symbol, quantity),
+            "newOrderRespType": "RESULT",
         }
         if reduce_only:
             params["reduceOnly"] = "true"
@@ -278,8 +279,28 @@ class BinanceFuturesDemoClient:
             params["symbol"] = symbol
         return self._get("/fapi/v1/openOrders", params=params, signed=True)
 
+    def get_open_algo_orders(self, symbol: Optional[str] = None, algo_type: str = "CONDITIONAL") -> list:
+        params = {"algoType": algo_type}
+        if symbol:
+            params["symbol"] = symbol
+        return self._get("/fapi/v1/openAlgoOrders", params=params, signed=True)
+
     def cancel_order(self, symbol: str, order_id: int) -> dict:
         return self._delete("/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
+
+    def cancel_algo_order(
+        self,
+        algo_id: Optional[int] = None,
+        client_algo_id: Optional[str] = None,
+    ) -> dict:
+        params = {}
+        if algo_id is not None:
+            params["algoId"] = algo_id
+        if client_algo_id is not None:
+            params["clientAlgoId"] = client_algo_id
+        if not params:
+            raise ValueError("Either algo_id or client_algo_id must be provided.")
+        return self._delete("/fapi/v1/algoOrder", params)
 
     def cancel_all_orders(self, symbol: str) -> dict:
         return self._delete("/fapi/v1/allOpenOrders", {"symbol": symbol})

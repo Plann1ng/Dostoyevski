@@ -40,7 +40,7 @@ SYMBOLS = [                         # Top performers from backtest
 ]
 
 # --- Risk Management (committee rules) ---
-RISK_PER_TRADE = 0.005              # 1% of account per trade (conservative start)
+RISK_PER_TRADE = 0.005              # 0.5% of account per trade (conservative start)
 MIN_RR = 1.5                        # Minimum risk:reward ratio
 MAX_POSITIONS_PER_SYMBOL = 1        # Never more than 1 position per coin
 MIN_BARS_BETWEEN_ENTRIES = 6        # Minimum 6 candles between entries on same coin

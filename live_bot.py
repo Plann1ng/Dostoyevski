@@ -35,7 +35,6 @@ import logging
 import os
 import sys
 import time
-import threading
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -84,7 +83,6 @@ class SymbolState:
         self.candles: List[dict] = []       # Historical candles
         self.last_entry_bar: int = -100     # Bar index of last entry
         self.position: Optional[dict] = None  # Active position info
-        self.pending_signal: Optional[dict] = None  # Signal waiting for next bar
 
     @property
     def n(self) -> int:
@@ -303,6 +301,7 @@ class TradingBot:
         self.symbols = symbols
         self.states: Dict[str, SymbolState] = {}
         self.daily_smas: Dict[str, float] = {}
+        self.last_sma_refresh_date: Optional[str] = None
         self.running = False
 
     def initialize(self):
@@ -337,7 +336,25 @@ class TradingBot:
                 logger.info(f"  {symbol}: {len(klines)} candles loaded "
                             f"({klines[0]['timestamp']} → {klines[-1]['timestamp']})")
 
-                # Fetch daily SMA
+            except Exception as e:
+                logger.error(f"  {symbol}: Failed to load — {e}")
+                continue
+
+        self.refresh_daily_smas(force=True)
+        self.last_sma_refresh_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        init_journal()
+        logger.info(f"\nInitialized {len(self.states)} symbols. Bot ready.")
+        return True
+
+    def refresh_daily_smas(self, force: bool = False):
+        """Refresh daily SMA values for all symbols (at least once per UTC day)."""
+        utc_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if not force and self.last_sma_refresh_date == utc_day:
+            return
+
+        logger.info("Refreshing daily SMA values...")
+        for symbol in self.symbols:
+            try:
                 daily_klines = fetch_full_klines(
                     self.client, symbol, "1d", total_bars=SMA_PERIOD + 10
                 )
@@ -348,16 +365,11 @@ class TradingBot:
                 else:
                     self.daily_smas[symbol] = 0.0
                     logger.warning(f"  {symbol}: Not enough daily data for SMA")
-
             except Exception as e:
-                logger.error(f"  {symbol}: Failed to load — {e}")
-                continue
+                logger.error(f"  {symbol}: SMA refresh failed — {e}")
+        self.last_sma_refresh_date = utc_day
 
-        init_journal()
-        logger.info(f"\nInitialized {len(self.states)} symbols. Bot ready.")
-        return True
-
-    def process_new_candle(self, symbol: str, candle: dict):
+    def process_new_candle(self, symbol: str, candle: dict, next_bar_open: Optional[float] = None):
         """
         Called when a new 1H candle closes.
         This is the core trading loop for one symbol.
@@ -365,12 +377,6 @@ class TradingBot:
         state = self.states.get(symbol)
         if state is None:
             return
-
-        # Execute any pending signal from the PREVIOUS candle
-        # (next-bar-open execution model)
-        if state.pending_signal is not None:
-            self._execute_signal(symbol, state, candle["open"])
-            state.pending_signal = None
 
         # Add the new candle
         state.candles.append(candle)
@@ -394,18 +400,21 @@ class TradingBot:
             rr = reward / risk if risk > 0 else 0
             logger.info(f"  R:R: {rr:.2f}:1")
             logger.info(f"  Quality: {signal['quality']:.1f}")
-            logger.info(f"  → Will execute at NEXT candle open")
+            if next_bar_open is not None:
+                logger.info(f"  → Next-bar-open model (reference open={next_bar_open:.2f})")
+            else:
+                logger.info(f"  → Next-bar-open model (reference open unavailable)")
             logger.info(f"{'='*50}")
 
-            # Store signal for execution on next candle open
-            state.pending_signal = signal
+            # Execute immediately after close so the fill occurs as close as possible
+            # to the next bar open in polling mode.
+            self._execute_signal(symbol, state, signal, expected_entry=next_bar_open)
 
-    def _execute_signal(self, symbol: str, state: SymbolState, open_price: float):
-        """Execute a pending signal at the current candle's open price."""
-        signal = state.pending_signal
-        if signal is None:
-            return
-
+    def _execute_signal(self, symbol: str, state: SymbolState, signal: dict, expected_entry: Optional[float] = None):
+        """
+        Execute a signal immediately at market.
+        Stop/target geometry keeps original risk distance and R:R from signal model.
+        """
         direction = signal["direction"]
         setup_type = signal["type"]
 
@@ -413,25 +422,7 @@ class TradingBot:
         original_risk = abs(signal["signal_price"] - signal["stop"])
         original_rr = abs(signal["target"] - signal["signal_price"]) / original_risk if original_risk > 0 else MIN_RR
 
-        if direction == "long":
-            entry = open_price
-            stop = entry - original_risk
-            target = entry + original_risk * original_rr
-        else:
-            entry = open_price
-            stop = entry + original_risk
-            target = entry - original_risk * original_rr
-
-        # Validate geometry
-        if direction == "long" and not (stop < entry < target):
-            logger.warning(f"  {symbol}: Geometry invalid after open adjustment — skipping")
-            return
-        if direction == "short" and not (target < entry < stop):
-            logger.warning(f"  {symbol}: Geometry invalid after open adjustment — skipping")
-            return
-
-        risk = abs(entry - stop)
-        if risk <= 0:
+        if original_risk <= 0:
             return
 
         # Calculate position size
@@ -442,14 +433,11 @@ class TradingBot:
             return
 
         risk_amount = balance * RISK_PER_TRADE
-        quantity = risk_amount / risk
+        quantity = risk_amount / original_risk
 
         # Round to exchange precision
         try:
             quantity = self.client.round_quantity(symbol, quantity)
-            entry = self.client.round_price(symbol, entry)
-            stop = self.client.round_price(symbol, stop)
-            target = self.client.round_price(symbol, target)
         except Exception as e:
             logger.error(f"  Failed to get symbol info: {e}")
             return
@@ -462,8 +450,12 @@ class TradingBot:
             entry_side = "BUY" if direction == "long" else "SELL"
             exit_side = "SELL" if direction == "long" else "BUY"
 
-            logger.info(f"  {symbol}: Executing MARKET {entry_side} {quantity} @ ~{entry:.2f}")
+            logger.info(f"  {symbol}: Executing MARKET {entry_side} {quantity}")
             order = self.client.place_market_order(symbol, entry_side, quantity)
+            executed_qty = float(order.get("executedQty", 0.0) or 0.0)
+            if executed_qty <= 0:
+                logger.warning(f"  {symbol}: market order not filled (executedQty={executed_qty})")
+                return
 
             avg_price = order.get("avgPrice")
             raw_price = order.get("price")
@@ -473,8 +465,32 @@ class TradingBot:
             elif raw_price not in (None, "", "0", "0.0", "0.00", "0.00000"):
                 fill_price = float(raw_price)
             else:
-                fill_price = entry
+                px = self.client.get_ticker_price(symbol)
+                fill_price = float(px.get("price"))
             logger.info(f"  {symbol}: FILLED at {fill_price:.2f}")
+            if expected_entry is not None:
+                logger.info(
+                    f"  {symbol}: next-open ref={expected_entry:.2f}, slippage={(fill_price - expected_entry):.6f}"
+                )
+
+            # Recompute exits from ACTUAL fill to preserve intended risk geometry.
+            if direction == "long":
+                stop = fill_price - original_risk
+                target = fill_price + original_risk * original_rr
+            else:
+                stop = fill_price + original_risk
+                target = fill_price - original_risk * original_rr
+
+            # Validate geometry
+            if direction == "long" and not (stop < fill_price < target):
+                logger.warning(f"  {symbol}: Geometry invalid after fill — skipping exits")
+                return
+            if direction == "short" and not (target < fill_price < stop):
+                logger.warning(f"  {symbol}: Geometry invalid after fill — skipping exits")
+                return
+
+            stop = self.client.round_price(symbol, stop)
+            target = self.client.round_price(symbol, target)
 
             logger.info(f"  {symbol}: Placing futures exits — TP={target:.2f}, SL={stop:.2f}")
 
@@ -517,9 +533,61 @@ class TradingBot:
         except Exception as e:
             logger.error(f"  {symbol}: Order failed — {e}")
             log_trade(
-                symbol, setup_type, direction, entry, stop, target,
-                quantity, signal["quality"], "FAILED", (e)
+                symbol, setup_type, direction, signal["signal_price"], signal["stop"], signal["target"],
+                quantity, signal["quality"], "FAILED", str(e)
             )
+
+    def reconcile_symbol_state(self, symbol: str):
+        """
+        Sync local position/order state with exchange reality to avoid stale lockups.
+        """
+        state = self.states.get(symbol)
+        if state is None:
+            return
+
+        try:
+            pos_data = self.client.get_position_risk(symbol=symbol)
+        except Exception as e:
+            logger.error(f"{symbol}: position reconcile failed (positionRisk) — {e}")
+            return
+
+        pos_list = pos_data if isinstance(pos_data, list) else [pos_data]
+        active_amt = 0.0
+        for pos in pos_list:
+            try:
+                amt = float(pos.get("positionAmt", 0.0))
+            except Exception:
+                amt = 0.0
+            if abs(amt) > 0:
+                active_amt += abs(amt)
+
+        has_exchange_position = active_amt > 0
+        has_local_position = state.position is not None
+
+        if has_local_position and not has_exchange_position:
+            logger.info(f"{symbol}: Exchange position closed; clearing local state.")
+            state.position = None
+            try:
+                open_orders = self.client.get_open_orders(symbol)
+                for order in open_orders:
+                    oid = order.get("orderId")
+                    if oid is not None:
+                        self.client.cancel_order(symbol, int(oid))
+
+                open_algo_orders = self.client.get_open_algo_orders(symbol)
+                for algo in open_algo_orders:
+                    algo_id = algo.get("algoId")
+                    client_algo_id = algo.get("clientAlgoId")
+                    if algo_id is not None:
+                        self.client.cancel_algo_order(algo_id=int(algo_id))
+                    elif client_algo_id:
+                        self.client.cancel_algo_order(client_algo_id=client_algo_id)
+            except Exception as e:
+                logger.warning(f"{symbol}: failed to cancel stale orders after close — {e}")
+
+        if (not has_local_position) and has_exchange_position:
+            logger.warning(f"{symbol}: Exchange has open position but local state is empty; adopting lock.")
+            state.position = {"direction": "unknown", "entry_time": datetime.now(timezone.utc).isoformat()}
 
     def run_poll_mode(self):
         self.running = True
@@ -529,14 +597,27 @@ class TradingBot:
             while self.running:
                 cycle += 1
                 now = datetime.now()
+                self.refresh_daily_smas(force=False)
+
+                server_time_ms = None
+                try:
+                    st = self.client.get_server_time()
+                    server_time_ms = int(st.get("serverTime", 0))
+                except Exception as e:
+                    logger.warning(f"Server time sync failed: {e}")
 
                 for symbol in self.symbols:
                     try:
+                        self.reconcile_symbol_state(symbol)
                         latest = self.client.get_klines(symbol, TIMEFRAME, limit=2)
                         if not latest or len(latest) < 2:
                             continue
 
                         raw = latest[-2]
+                        close_time = int(raw[6])
+                        if server_time_ms and close_time > server_time_ms:
+                            # Candle not truly closed yet according to exchange clock.
+                            continue
                         closed_candle = {
                             "timestamp": int(raw[0]),
                             "open": float(raw[1]),
@@ -544,6 +625,7 @@ class TradingBot:
                             "low": float(raw[3]),
                             "close": float(raw[4]),
                             "volume": float(raw[5]),
+                            "close_time": close_time,
                         }
 
                         state = self.states.get(symbol)
@@ -555,7 +637,8 @@ class TradingBot:
                             logger.info(
                                 f"{symbol}: New candle closed @ {closed_candle['timestamp']}"
                             )
-                            self.process_new_candle(symbol, closed_candle)
+                            next_open = float(latest[-1][1])
+                            self.process_new_candle(symbol, closed_candle, next_bar_open=next_open)
 
                     except Exception as e:
                         logger.error(f"{symbol}: Polling error — {e}")
@@ -564,10 +647,8 @@ class TradingBot:
                 # Status heartbeat every 10 cycles (~10 minutes if sleep=60)
                 if cycle % 10 == 0:
                     active = sum(1 for s in self.states.values() if s.position)
-                    pending = sum(1 for s in self.states.values() if s.pending_signal)
                     logger.info(f"[Heartbeat] {now.strftime('%H:%M')} | "
-                                f"Positions: {active} | Pending signals: {pending} | "
-                                f"Cycle: {cycle}")
+                                f"Positions: {active} | Cycle: {cycle}")
 
                 time.sleep(10)
 
